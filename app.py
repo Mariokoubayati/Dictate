@@ -5,6 +5,7 @@ Hold Fn to talk; release to transcribe (local whisper.cpp), clean up
 Double-tap Fn for hands-free recording; tap again to stop.
 """
 
+import os
 import sys
 import threading
 
@@ -17,6 +18,25 @@ from AppKit import (
     NSEventMaskKeyDown,
     NSWorkspace,
     NSWorkspaceDidWakeNotification,
+)
+from Quartz import (
+    CFMachPortCreateRunLoopSource,
+    CFRunLoopAddSource,
+    CFRunLoopGetMain,
+    CFRunLoopRemoveSource,
+    CGEventMaskBit,
+    CGEventTapCreate,
+    CGEventTapEnable,
+    CGEventTapIsEnabled,
+    CFMachPortInvalidate,
+    kCFRunLoopCommonModes,
+    kCGEventFlagsChanged,
+    kCGEventKeyDown,
+    kCGEventTapDisabledByTimeout,
+    kCGEventTapDisabledByUserInput,
+    kCGEventTapOptionListenOnly,
+    kCGHeadInsertEventTap,
+    kCGSessionEventTap,
 )
 from AVFoundation import AVCaptureDevice, AVMediaTypeAudio
 from Foundation import NSOperationQueue
@@ -47,6 +67,9 @@ class DictateApp(rumps.App):
         self._recorder = Recorder()
         self._flag_mask, self._keycode = config.HOTKEY_SPECS[config.HOTKEY]
         self._monitors = []
+        self._tap = None
+        self._tap_source = None
+        self._tap_failures = 0
 
         print("Loading whisper model...", flush=True)
         self._transcriber = transcribe.Transcriber()
@@ -57,6 +80,7 @@ class DictateApp(rumps.App):
         self._install_monitors()
         self._install_wake_observer()
         self._install_rearm_timer()
+        self._install_watchdog()
 
     # --- permissions ---
 
@@ -98,6 +122,60 @@ class DictateApp(rumps.App):
     # --- hotkey capture ---
 
     def _install_monitors(self):
+        # Primary: a CGEventTap, which (unlike NSEvent global monitors) can be
+        # health-checked and re-enabled. NSEvent monitors are the fallback if
+        # the tap can't be created (e.g. Input Monitoring not granted).
+        self._remove_monitors()
+        if self._install_tap():
+            return
+        print("event tap unavailable (Input Monitoring?) — using NSEvent fallback", flush=True)
+        self._install_ns_monitors()
+
+    def _install_tap(self):
+        mask = CGEventMaskBit(kCGEventFlagsChanged) | CGEventMaskBit(kCGEventKeyDown)
+
+        def callback(proxy, etype, cgevent, refcon):
+            try:
+                if etype in (kCGEventTapDisabledByTimeout, kCGEventTapDisabledByUserInput):
+                    print("event tap was disabled by the system — re-enabling", flush=True)
+                    if self._tap is not None:
+                        CGEventTapEnable(self._tap, True)
+                    return cgevent
+                event = NSEvent.eventWithCGEvent_(cgevent)
+                if event is not None:
+                    if etype == kCGEventFlagsChanged:
+                        self._on_flags_changed(event)
+                    else:
+                        self._on_key_down(event)
+            except Exception as exc:
+                print(f"event tap handler error: {exc}", file=sys.stderr, flush=True)
+            return cgevent
+
+        tap = CGEventTapCreate(
+            kCGSessionEventTap,
+            kCGHeadInsertEventTap,
+            kCGEventTapOptionListenOnly,
+            mask,
+            callback,
+            None,
+        )
+        if tap is None:
+            return False
+        source = CFMachPortCreateRunLoopSource(None, tap, 0)
+        CFRunLoopAddSource(CFRunLoopGetMain(), source, kCFRunLoopCommonModes)
+        CGEventTapEnable(tap, True)
+        self._tap, self._tap_source = tap, source
+        return True
+
+    def _remove_tap(self):
+        if self._tap is None:
+            return
+        CGEventTapEnable(self._tap, False)
+        CFRunLoopRemoveSource(CFRunLoopGetMain(), self._tap_source, kCFRunLoopCommonModes)
+        CFMachPortInvalidate(self._tap)
+        self._tap = self._tap_source = None
+
+    def _install_ns_monitors(self):
         handler_global = NSEvent.addGlobalMonitorForEventsMatchingMask_handler_(
             NSEventMaskFlagsChanged, self._on_flags_changed
         )
@@ -113,6 +191,7 @@ class DictateApp(rumps.App):
         self._monitors = [handler_global, handler_local, history_global, history_local]
 
     def _remove_monitors(self):
+        self._remove_tap()
         for monitor in self._monitors:
             if monitor is not None:
                 NSEvent.removeMonitor_(monitor)
@@ -131,7 +210,6 @@ class DictateApp(rumps.App):
 
     def _on_wake(self, notification):
         print("system woke — re-arming hotkey monitors", flush=True)
-        self._remove_monitors()
         self._install_monitors()
 
     def _install_rearm_timer(self):
@@ -149,8 +227,33 @@ class DictateApp(rumps.App):
     def _periodic_rearm(self, _timer):
         if self._fsm.state is not State.IDLE:
             return  # avoid swapping monitors out from under an active recording
-        self._remove_monitors()
         self._install_monitors()
+
+    def _install_watchdog(self):
+        self._watchdog = rumps.Timer(
+            self._check_health, config.WATCHDOG_INTERVAL_SECONDS
+        )
+        self._watchdog.start()
+
+    def _check_health(self, _timer):
+        # Tap alive and enabled -> healthy. Otherwise rebuild; if rebuilding
+        # keeps failing, exit non-zero so launchd restarts the whole process.
+        if self._fsm.state is not State.IDLE:
+            return
+        if self._tap is not None and CGEventTapIsEnabled(self._tap):
+            self._tap_failures = 0
+            return
+        if self._tap is None and self._monitors:
+            return  # running on NSEvent fallback; periodic re-arm covers it
+        print("hotkey tap unhealthy — rebuilding", flush=True)
+        self._install_monitors()
+        if self._tap is not None and CGEventTapIsEnabled(self._tap):
+            self._tap_failures = 0
+            return
+        self._tap_failures += 1
+        if self._tap_failures >= 3:
+            print("hotkey tap cannot be restored — exiting for launchd restart", flush=True)
+            os._exit(1)
 
     def _on_flags_changed_local(self, event):
         self._on_flags_changed(event)

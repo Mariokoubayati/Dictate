@@ -76,3 +76,4 @@ PASTE_SETTLE_SECONDS = 0.5  # wait before restoring the previous clipboard
 
 # --- Self-healing ---
 MONITOR_REARM_INTERVAL_SECONDS = 300  # safety-net re-arm of hotkey monitors
+WATCHDOG_INTERVAL_SECONDS = 20  # tap health check; restart process if unrecoverable
