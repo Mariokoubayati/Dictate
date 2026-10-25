@@ -1,0 +1,16 @@
+# Python
+venv/
+__pycache__/
+*.pyc
+
+# Local data and logs (contain your dictated text)
+history.db
+dictate.log
+
+# Whisper model (download it, see README)
+models/
+
+# Test audio and editor/OS files
+*.wav
+.DS_Store
+.claude/
